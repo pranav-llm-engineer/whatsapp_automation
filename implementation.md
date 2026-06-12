@@ -1,5 +1,5 @@
 # Coworking Space AI Chatbot — Implementation Plan
-**Stack:** FastAPI · Streamlit · OpenRouter · ChromaDB · SQLite  
+**Stack:** FastAPI · Streamlit · OpenRouter (Groq) · Supabase (PostgreSQL + pgvector) · OpenAI Embeddings
 **Pattern:** RAG + Stateful Onboarding + Persistent Sessions + Dummy Payment Gateway
 
 ---
@@ -10,9 +10,10 @@
 |------|-----------|
 | Customer Q&A (pricing, amenities, policies) | RAG over structured KB markdown |
 | Zero pricing hallucination | Hard retrieval gate — pricing ONLY from context |
-| Conversational onboarding (one field at a time) | State-machine in SQLite, resumed per session |
-| Persistent user profile | SQLite user record + session token |
+| Conversational onboarding (one field at a time) | State-machine in PostgreSQL, resumed per session |
+| Persistent user profile | Supabase PostgreSQL user record + session token |
 | Payment flow | Dummy gateway with mock success/fail |
+| Ultra-low latency responses | Groq LPU inference via OpenRouter |
 
 ---
 
@@ -31,12 +32,12 @@
 │                                                                 │
 │  ┌──────────────┐  ┌────────────────────────────────────────┐  │
 │  │  LLM Service │  │           RAG Service                  │  │
-│  │  OpenRouter  │  │  ChromaDB  ←  KB Ingestor              │  │
+│  │ Groq Llama 3 │  │ Supabase pgvector ← OpenAI Embeddings  │  │
 │  └──────┬───────┘  └──────────────────┬─────────────────────┘  │
 │         │                             │                         │
 │  ┌──────▼─────────────────────────────▼─────────────────────┐  │
 │  │              Session & State Service                     │  │
-│  │              SQLite (users · sessions · conversations)   │  │
+│  │        Supabase PostgreSQL (users·sessions·conversations)│  │
 │  └──────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -50,7 +51,7 @@ cowork-assistant/
 │
 ├── backend/
 │   ├── main.py                        # FastAPI app init, CORS, router mounting
-│   ├── config.py                      # Env vars (OPENROUTER_API_KEY, DB paths)
+│   ├── config.py                      # Env vars (OPENROUTER, SUPABASE, OPENAI)
 │   │
 │   ├── routers/
 │   │   ├── auth.py                    # POST /register, POST /login
@@ -59,22 +60,22 @@ cowork-assistant/
 │   │   └── payment.py                 # POST /payment/initiate, POST /payment/confirm
 │   │
 │   ├── services/
-│   │   ├── rag_service.py             # Embed query → ChromaDB → return context chunks
-│   │   ├── llm_service.py             # OpenRouter call, system prompt builder
+│   │   ├── rag_service.py             # OpenAI Embed query → Supabase pgvector
+│   │   ├── llm_service.py             # OpenRouter (Groq) call, system prompt builder
 │   │   ├── session_service.py         # Create/load session, conversation history
 │   │   ├── onboarding_service.py      # State machine: next field, validate, save
 │   │   └── payment_service.py         # Dummy gateway logic
 │   │
 │   ├── db/
-│   │   ├── database.py                # SQLite engine + session factory (SQLAlchemy)
+│   │   ├── database.py                # Supabase PostgreSQL engine setup
 │   │   ├── models.py                  # ORM models (User, Session, Conversation, OnboardingState)
-│   │   └── vector_store.py            # ChromaDB client init + collection setup
+│   │   └── vector_store.py            # Supabase client init + pgvector setup
 │   │
 │   ├── knowledge_base/
 │   │   └── cowork_kb.md               # ← Your 8-category WhatsApp-derived KB goes here
 │   │
 │   └── scripts/
-│       └── ingest_kb.py               # One-time script: chunk KB → embed → upsert ChromaDB
+│       └── ingest_kb.py               # One-time script: chunk KB → embed (OpenAI) → Supabase pgvector
 │
 ├── frontend/
 │   └── app.py                         # Streamlit UI (all pages)
@@ -86,16 +87,16 @@ cowork-assistant/
 
 ---
 
-## 4. Database Schema (SQLite via SQLAlchemy)
+## 4. Database Schema (Supabase PostgreSQL via SQLAlchemy/Supabase Client)
 
 ### 4.1 `users` table
 ```sql
 CREATE TABLE users (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    id              SERIAL PRIMARY KEY,
     phone           TEXT UNIQUE NOT NULL,
     email           TEXT UNIQUE,
     password_hash   TEXT NOT NULL,
-    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at      TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 ```
 
@@ -117,42 +118,54 @@ CREATE TABLE user_profiles (
     gstin               TEXT,
     onboarding_step     TEXT DEFAULT 'full_name',  -- current pending field
     onboarding_complete BOOLEAN DEFAULT FALSE,
-    updated_at          DATETIME DEFAULT CURRENT_TIMESTAMP
+    updated_at          TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 ```
 
 ### 4.3 `sessions` table
 ```sql
 CREATE TABLE sessions (
-    id          TEXT PRIMARY KEY,   -- UUID token
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id     INTEGER REFERENCES users(id),
-    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
-    last_active DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at  TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    last_active TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 ```
 
 ### 4.4 `conversations` table
 ```sql
 CREATE TABLE conversations (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id  TEXT REFERENCES sessions(id),
+    id          SERIAL PRIMARY KEY,
+    session_id  UUID REFERENCES sessions(id),
     role        TEXT NOT NULL,       -- "user" | "assistant"
     content     TEXT NOT NULL,
-    timestamp   DATETIME DEFAULT CURRENT_TIMESTAMP
+    timestamp   TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 ```
 
 ### 4.5 `payments` table
 ```sql
 CREATE TABLE payments (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    id              SERIAL PRIMARY KEY,
     user_id         INTEGER REFERENCES users(id),
     amount          REAL,
     membership_type TEXT,
     billing_cycle   TEXT,
     status          TEXT DEFAULT 'pending',  -- "pending" | "success" | "failed"
     txn_ref         TEXT,
-    initiated_at    DATETIME DEFAULT CURRENT_TIMESTAMP
+    initiated_at    TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+### 4.6 `cowork_kb` vector table
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE cowork_kb (
+    id          SERIAL PRIMARY KEY,
+    content     TEXT NOT NULL,
+    metadata    JSONB,
+    embedding   vector(1536) -- OpenAI text-embedding-3-small dimension
 );
 ```
 
@@ -181,9 +194,8 @@ Run once (or on KB update):
 1. Read cowork_kb.md
 2. Split by markdown headers (##, ###) → semantic chunks
 3. Each chunk gets metadata: { category, heading, source: "KB" }
-4. Embed each chunk via sentence-transformers  
-   (model: "all-MiniLM-L6-v2" — runs locally, free)
-5. Upsert into ChromaDB collection "cowork_kb"
+4. Embed each chunk via OpenAI text-embedding-3-small
+5. Upsert into Supabase `cowork_kb` table with embeddings
 ```
 Command:
 ```bash
@@ -194,10 +206,12 @@ python backend/scripts/ingest_kb.py
 ```python
 def retrieve_context(query: str, top_k: int = 4) -> str:
     """
-    Embed query → similarity search ChromaDB → return top_k chunks as string
+    Embed query via OpenAI → similarity search Supabase pgvector → return top_k chunks
     """
-    results = collection.query(query_texts=[query], n_results=top_k)
-    return "\n\n---\n\n".join(results["documents"][0])
+    query_embedding = get_openai_embedding(query)
+    # Supabase RPC or direct SQL query using vector distance (<->)
+    results = supabase.rpc('match_kb_chunks', {'query_embedding': query_embedding, 'match_threshold': 0.7, 'match_count': top_k}).execute()
+    return "\n\n---\n\n".join([doc['content'] for doc in results.data])
 ```
 
 ### 5.4 Anti-Hallucination: Pricing Gate
@@ -239,12 +253,12 @@ Do not ask for any other information in this turn.
     return base
 ```
 
-### 6.2 OpenRouter Call
+### 6.2 OpenRouter Call (Groq LPU Inference)
 ```python
 import httpx
 
 OPENROUTER_API_KEY = config.OPENROUTER_API_KEY
-MODEL = "mistralai/mistral-7b-instruct"   # swap freely via config
+MODEL = "groq/llama-3.1-70b-versatile"   # ultra-low latency Groq model
 
 async def call_llm(messages: list, system_prompt: str) -> str:
     payload = {
@@ -421,10 +435,11 @@ if st.session_state.get("payment_pending"):
 
 ```env
 OPENROUTER_API_KEY=sk-or-...
-MODEL_ID=mistralai/mistral-7b-instruct       # or openai/gpt-4o-mini, etc.
-SQLITE_DB_PATH=./backend/db/cowork.db
-CHROMA_DB_PATH=./backend/db/chroma
-EMBEDDING_MODEL=all-MiniLM-L6-v2
+MODEL_ID=groq/llama-3.1-70b-versatile        # Groq LPU inference for ultra-low latency
+SUPABASE_URL=https://...supabase.co
+SUPABASE_KEY=eyJ...
+DATABASE_URL=postgresql://postgres:...
+OPENAI_API_KEY=sk-proj-...                   # For text-embedding-3-small
 SECRET_KEY=your-jwt-secret-here
 ```
 
@@ -438,8 +453,9 @@ uvicorn
 streamlit
 httpx
 sqlalchemy
-chromadb
-sentence-transformers
+psycopg2-binary              # or asyncpg for Supabase PostgreSQL
+supabase                     # Supabase client (optional if using pure raw SQL)
+openai                       # OpenAI embeddings
 langchain                    # for text splitter only
 python-jose[cryptography]    # JWT session tokens
 passlib[bcrypt]              # password hashing
@@ -451,20 +467,21 @@ pydantic
 
 ## 13. Implementation Phases
 
-### Phase 1 — Foundation (Day 1–2)
+### Phase 1 — Foundation & DB Setup (Day 1–2)
 - [ ] Set up project structure, `.env`, config
-- [ ] SQLite models + Alembic migrations (or `Base.metadata.create_all`)
+- [ ] Provision Supabase PostgreSQL and enable `pgvector` extension
+- [ ] Create SQLAlchemy models / migrations for `users`, `user_profiles`, `sessions`, `conversations`
 - [ ] `/auth/register` and `/auth/login` with bcrypt + JWT session
 - [ ] Basic Streamlit login/register page
 
 ### Phase 2 — RAG Pipeline (Day 2–3)
 - [ ] Place `cowork_kb.md` in `knowledge_base/`
-- [ ] Write and run `ingest_kb.py` (chunk → embed → ChromaDB)
-- [ ] `rag_service.py` with `retrieve_context(query)`
+- [ ] Write and run `ingest_kb.py` (chunk → OpenAI embed → Supabase pgvector)
+- [ ] `rag_service.py` with `retrieve_context(query)` using vector similarity search
 - [ ] Test retrieval manually with pricing queries
 
 ### Phase 3 — Chat Endpoint (Day 3–4)
-- [ ] `/chat` endpoint: load history → RAG → build prompt → OpenRouter → save reply
+- [ ] `/chat` endpoint: load history → RAG → build prompt → OpenRouter (Groq) → save reply
 - [ ] System prompt with pricing gate
 - [ ] Session history (last 10 turns sent to LLM for context)
 - [ ] Streamlit chat UI wired to backend
@@ -493,25 +510,21 @@ pydantic
 
 | Decision | Why |
 |----------|-----|
-| SQLite over Postgres | Zero infra overhead for testing; swap to Postgres by changing connection string |
-| ChromaDB over Pinecone | Local, persistent, no API key; production swap = 1 line change |
-| `all-MiniLM-L6-v2` embeddings | Runs fully offline, fast, good quality for English text |
-| OpenRouter over direct API | Model-agnostic; swap Mistral → GPT-4o → Claude with one env var |
+| Supabase (PostgreSQL + pgvector) | Extremely fast vector retrieval, persistent, unifies DB and Vector store in one place. Fixes ChromaDB local file I/O latency. |
+| OpenAI Embeddings | API-based (`text-embedding-3-small`) removes CPU bottleneck of calculating local embeddings on Render, dramatically speeding up RAG. |
+| OpenRouter with Groq models | LPUs provide the absolute fastest generation times (~300ms vs 2-3s for GPUs), critical for WhatsApp-like responsiveness. |
 | Onboarding as DB state (not LLM memory) | LLMs forget; DB never does. Resumption is deterministic |
 | Pricing gate in system prompt | Prevents any confabulated number reaching the user |
 | Session token in Streamlit `st.session_state` | Lightweight; survives tab refresh within same browser session |
 
 ---
 
-## 15. Swap-Out Map (for Production)
+## 15. Infrastructure Optimization (For Production)
 
-| Testing Component | Production Replacement |
-|-------------------|----------------------|
-| SQLite | PostgreSQL (change `DATABASE_URL`) |
-| ChromaDB (local) | Pinecone / Weaviate / Qdrant |
-| Dummy payment | Razorpay / Stripe SDK |
-| JWT in-memory sessions | Redis session store |
-| `all-MiniLM-L6-v2` | OpenAI `text-embedding-3-small` or Cohere |
+To achieve the best possible performance:
+1. **Co-location:** Ensure the Render web service and the Supabase database are deployed in the same geographic region (e.g., both US-East or both AP-South-1).
+2. **Server Tier:** Avoid Render's Free Tier to eliminate "cold start" waking delays. Use at least the Starter Tier.
+3. **Voice Notes:** If adding audio inputs, use Groq's Whisper Large V3 API for near-instant transcription.
 
 ---
 
